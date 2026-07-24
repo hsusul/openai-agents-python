@@ -607,12 +607,8 @@ class RealtimeSession(RealtimeModelListener):
             tool_lookup_key=tool_lookup_key,
         )
 
-        needs_approval = await self._function_needs_approval(function_tool, tool_call)
-        if self._closing or self._closed:
-            return None
-        if not needs_approval:
-            return True
-
+        # Resolved approve/reject decisions are authoritative; do not re-await
+        # needs_approval for a call whose status is already stored.
         approval_status = self._context_wrapper.get_approval_status(
             function_tool.name,
             tool_call.call_id,
@@ -623,6 +619,12 @@ class RealtimeSession(RealtimeModelListener):
             return True
         if approval_status is False:
             return False
+
+        needs_approval = await self._function_needs_approval(function_tool, tool_call)
+        if self._closing or self._closed:
+            return None
+        if not needs_approval:
+            return True
 
         if self._pre_approval_tool_input_guardrails_enabled():
             rejected_message = await self._run_tool_input_guardrails(

@@ -1394,6 +1394,54 @@ async def test_resume_skips_needs_approval_checker_when_status_resolved() -> Non
 
 
 @pytest.mark.asyncio
+async def test_execute_path_skips_needs_approval_checker_when_status_resolved() -> None:
+    """Resolved approvals must short-circuit needs_approval on the execute path.
+
+    Planning helpers already skip the checker once status is True/False (#3229/#3259).
+    Resume still re-enters tool execution, which previously re-awaited needs_approval
+    before reading stored status — so a checker that raises after the first interrupt
+    aborted an already-approved tool call.
+    """
+    checker_calls: list[str] = []
+
+    async def needs_approval(_ctx: Any, _args: dict[str, Any], call_id: str) -> bool:
+        checker_calls.append(call_id)
+        if len(checker_calls) > 1:
+            raise AssertionError(
+                f"needs_approval must not run after approval is resolved; calls={checker_calls}"
+            )
+        return True
+
+    @function_tool(needs_approval=needs_approval)
+    async def sensitive(value: str) -> str:
+        return f"ran:{value}"
+
+    model = FakeModel()
+    agent = Agent(name="agent", model=model, tools=[sensitive])
+    model.add_multiple_turn_outputs(
+        [
+            [make_function_tool_call(sensitive.name, call_id="call-1", arguments='{"value":"x"}')],
+            [get_text_message("done")],
+        ]
+    )
+
+    first = await Runner.run(agent, "hello")
+    assert len(first.interruptions) == 1
+    assert checker_calls == ["call-1"]
+
+    state = first.to_state()
+    state.approve(first.interruptions[0])
+    resumed = await Runner.run(agent, state)
+
+    assert resumed.final_output == "done"
+    assert checker_calls == ["call-1"]
+    assert any(
+        isinstance(item, ToolCallOutputItem) and item.output == "ran:x"
+        for item in resumed.new_items
+    )
+
+
+@pytest.mark.asyncio
 async def test_collect_runs_by_approval_skips_checker_when_status_resolved() -> None:
     """Approved/rejected shell calls must not invoke needs_approval_checker.
 

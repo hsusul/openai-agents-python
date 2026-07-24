@@ -1683,14 +1683,9 @@ class _FunctionToolBatchExecutor:
         raw_tool_call: ResponseFunctionToolCall,
         span_fn: Span[Any],
     ) -> Any | None:
-        needs_approval_result = await function_needs_approval(
-            func_tool,
-            self.context_wrapper,
-            tool_call,
-        )
-        if not needs_approval_result:
-            return None
-
+        # Resolved approve/reject decisions are authoritative. Check stored status
+        # before awaiting needs_approval so sticky/resume decisions cannot be undone
+        # by a checker that raises or returns a different result.
         tool_namespace = get_tool_call_namespace(raw_tool_call)
         if tool_namespace is None and is_deferred_top_level_function_tool(func_tool):
             tool_namespace = func_tool.name
@@ -1703,88 +1698,95 @@ class _FunctionToolBatchExecutor:
             tool_namespace=tool_namespace,
             tool_lookup_key=tool_lookup_key,
         )
-        if approval_status is None:
-            if self._should_run_pre_approval_tool_input_guardrails():
-                tool_context_namespace = get_tool_call_namespace(raw_tool_call)
-                if tool_context_namespace is None:
-                    tool_context_namespace = get_tool_call_namespace(tool_call)
-                tool_context = ToolContext.from_agent_context(
-                    self.context_wrapper,
-                    tool_call.call_id,
-                    tool_call=raw_tool_call,
-                    tool_namespace=tool_context_namespace,
-                    agent=self.public_agent,
-                    run_config=self.config,
-                )
-                rejected_message = await _execute_tool_input_guardrails(
-                    func_tool=func_tool,
-                    tool_context=tool_context,
-                    agent=self.public_agent,
-                    tool_input_guardrail_results=self.tool_input_guardrail_results,
-                )
-                if rejected_message is not None:
-                    return FunctionToolResult(
-                        tool=func_tool,
-                        output=rejected_message,
-                        run_item=function_rejection_item(
-                            self.public_agent,
-                            tool_call,
-                            rejection_message=rejected_message,
-                            output_json_schema=func_tool.output_json_schema,
-                            scope_id=self.tool_state_scope_id,
-                            tool_origin=get_function_tool_origin(func_tool),
-                        ),
-                    )
-            approval_item = ToolApprovalItem(
-                agent=self.public_agent,
-                raw_item=raw_tool_call,
-                tool_name=func_tool.name,
+        if approval_status is True:
+            return None
+        if approval_status is False:
+            rejection_message = await resolve_approval_rejection_message(
+                context_wrapper=self.context_wrapper,
+                run_config=self.config,
+                tool_type="function",
+                tool_name=tool_trace_name(func_tool.name, tool_namespace) or func_tool.name,
+                call_id=tool_call.call_id,
                 tool_namespace=tool_namespace,
-                tool_origin=get_function_tool_origin(func_tool),
                 tool_lookup_key=tool_lookup_key,
-                _allow_bare_name_alias=should_allow_bare_name_approval_alias(
-                    func_tool,
-                    self.available_function_tools,
+            )
+            span_fn.set_error(
+                SpanError(
+                    message=rejection_message,
+                    data={
+                        "tool_name": func_tool.name,
+                        "error": (
+                            f"Tool execution for {tool_call.call_id} was manually rejected by user."
+                        ),
+                    },
+                )
+            )
+            span_fn.span_data.output = rejection_message
+            return FunctionToolResult(
+                tool=func_tool,
+                output=rejection_message,
+                run_item=function_rejection_item(
+                    self.public_agent,
+                    tool_call,
+                    rejection_message=rejection_message,
+                    output_json_schema=func_tool.output_json_schema,
+                    scope_id=self.tool_state_scope_id,
+                    tool_origin=get_function_tool_origin(func_tool),
                 ),
             )
-            return FunctionToolResult(tool=func_tool, output=None, run_item=approval_item)
 
-        if approval_status is not False:
+        needs_approval_result = await function_needs_approval(
+            func_tool,
+            self.context_wrapper,
+            tool_call,
+        )
+        if not needs_approval_result:
             return None
 
-        rejection_message = await resolve_approval_rejection_message(
-            context_wrapper=self.context_wrapper,
-            run_config=self.config,
-            tool_type="function",
-            tool_name=tool_trace_name(func_tool.name, tool_namespace) or func_tool.name,
-            call_id=tool_call.call_id,
-            tool_namespace=tool_namespace,
-            tool_lookup_key=tool_lookup_key,
-        )
-        span_fn.set_error(
-            SpanError(
-                message=rejection_message,
-                data={
-                    "tool_name": func_tool.name,
-                    "error": (
-                        f"Tool execution for {tool_call.call_id} was manually rejected by user."
-                    ),
-                },
+        if self._should_run_pre_approval_tool_input_guardrails():
+            tool_context_namespace = get_tool_call_namespace(raw_tool_call)
+            if tool_context_namespace is None:
+                tool_context_namespace = get_tool_call_namespace(tool_call)
+            tool_context = ToolContext.from_agent_context(
+                self.context_wrapper,
+                tool_call.call_id,
+                tool_call=raw_tool_call,
+                tool_namespace=tool_context_namespace,
+                agent=self.public_agent,
+                run_config=self.config,
             )
-        )
-        span_fn.span_data.output = rejection_message
-        return FunctionToolResult(
-            tool=func_tool,
-            output=rejection_message,
-            run_item=function_rejection_item(
-                self.public_agent,
-                tool_call,
-                rejection_message=rejection_message,
-                output_json_schema=func_tool.output_json_schema,
-                scope_id=self.tool_state_scope_id,
-                tool_origin=get_function_tool_origin(func_tool),
+            rejected_message = await _execute_tool_input_guardrails(
+                func_tool=func_tool,
+                tool_context=tool_context,
+                agent=self.public_agent,
+                tool_input_guardrail_results=self.tool_input_guardrail_results,
+            )
+            if rejected_message is not None:
+                return FunctionToolResult(
+                    tool=func_tool,
+                    output=rejected_message,
+                    run_item=function_rejection_item(
+                        self.public_agent,
+                        tool_call,
+                        rejection_message=rejected_message,
+                        output_json_schema=func_tool.output_json_schema,
+                        scope_id=self.tool_state_scope_id,
+                        tool_origin=get_function_tool_origin(func_tool),
+                    ),
+                )
+        approval_item = ToolApprovalItem(
+            agent=self.public_agent,
+            raw_item=raw_tool_call,
+            tool_name=func_tool.name,
+            tool_namespace=tool_namespace,
+            tool_origin=get_function_tool_origin(func_tool),
+            tool_lookup_key=tool_lookup_key,
+            _allow_bare_name_alias=should_allow_bare_name_approval_alias(
+                func_tool,
+                self.available_function_tools,
             ),
         )
+        return FunctionToolResult(tool=func_tool, output=None, run_item=approval_item)
 
     async def _execute_single_tool_body(
         self,
