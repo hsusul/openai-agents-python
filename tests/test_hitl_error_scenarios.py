@@ -6,7 +6,11 @@ from collections.abc import Callable
 from typing import Any, Optional, cast
 
 import pytest
-from openai.types.responses import ResponseComputerToolCall, ResponseFunctionToolCall
+from openai.types.responses import (
+    ResponseComputerToolCall,
+    ResponseCustomToolCall,
+    ResponseFunctionToolCall,
+)
 from openai.types.responses.response_computer_tool_call import ActionScreenshot
 from openai.types.responses.response_input_param import (
     ComputerCallOutput,
@@ -18,6 +22,7 @@ from agents import (
     Agent,
     ApplyPatchTool,
     ComputerTool,
+    CustomTool,
     LocalShellTool,
     Runner,
     RunResult,
@@ -43,9 +48,11 @@ from agents.run import RunConfig
 from agents.run_internal import run_loop
 from agents.run_internal.agent_bindings import bind_execution_agent, bind_public_agent
 from agents.run_internal.run_loop import (
+    ApplyPatchAction,
     NextStepInterruption,
     NextStepRunAgain,
     ProcessedResponse,
+    ShellAction,
     ToolRunApplyPatchCall,
     ToolRunComputerAction,
     ToolRunFunction,
@@ -53,6 +60,9 @@ from agents.run_internal.run_loop import (
     ToolRunShellCall,
     extract_tool_call_id,
 )
+from agents.run_internal.run_steps import ToolRunCustom
+from agents.run_internal.tool_actions import CustomToolAction
+from agents.run_internal.tool_execution import execute_function_tool_calls
 from agents.run_internal.tool_planning import (
     _collect_runs_by_approval,
     _select_function_tool_runs_for_resume,
@@ -1439,6 +1449,154 @@ async def test_execute_path_skips_needs_approval_checker_when_status_resolved() 
         isinstance(item, ToolCallOutputItem) and item.output == "ran:x"
         for item in resumed.new_items
     )
+
+
+@pytest.mark.parametrize("tool_kind", ["function", "shell", "custom", "apply_patch"])
+@pytest.mark.asyncio
+async def test_sticky_reject_takes_precedence_when_needs_approval_returns_false(
+    tool_kind: str,
+) -> None:
+    """Sticky always_reject must win even when needs_approval would return False.
+
+    Each Runner execute path previously consulted the dynamic checker before stored
+    status. A checker returning False then executed the tool despite always_reject.
+    """
+    checker_calls: list[str] = []
+    executed: list[str] = []
+    context_wrapper = make_context_wrapper()
+
+    async def allow_without_approval(_ctx: Any, _payload: Any, call_id: str) -> bool:
+        checker_calls.append(call_id)
+        return False
+
+    if tool_kind == "function":
+
+        @function_tool(needs_approval=allow_without_approval)
+        async def sensitive() -> str:
+            executed.append("function")
+            return "should-not-run"
+
+        agent = Agent(name="agent", tools=[sensitive])
+        prior_function_call = make_function_tool_call(sensitive.name, call_id="call-prior")
+        context_wrapper.reject_tool(
+            ToolApprovalItem(agent=agent, raw_item=prior_function_call),
+            always_reject=True,
+        )
+        next_function_call = make_function_tool_call(sensitive.name, call_id="call-next")
+        function_results, _, _ = await execute_function_tool_calls(
+            bindings=bind_public_agent(agent),
+            tool_runs=[ToolRunFunction(tool_call=next_function_call, function_tool=sensitive)],
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert [result.output for result in function_results] == [HITL_REJECTION_MSG]
+    elif tool_kind == "shell":
+
+        def shell_executor(_req: Any) -> str:
+            executed.append("shell")
+            return "should-not-run"
+
+        shell_tool = ShellTool(
+            executor=shell_executor,
+            needs_approval=allow_without_approval,
+        )
+        agent = Agent(name="agent", tools=[shell_tool])
+        prior_shell_call = cast(dict[str, Any], make_shell_call("call-prior"))
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=prior_shell_call,
+                tool_name=shell_tool.name,
+            ),
+            always_reject=True,
+        )
+        next_shell_call = cast(dict[str, Any], make_shell_call("call-next"))
+        result = await ShellAction.execute(
+            agent=agent,
+            call=ToolRunShellCall(tool_call=next_shell_call, shell_tool=shell_tool),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert HITL_REJECTION_MSG in str(result.output)
+    elif tool_kind == "custom":
+
+        async def invoke_custom(_ctx: Any, _raw: str) -> str:
+            executed.append("custom")
+            return "should-not-run"
+
+        custom_tool = CustomTool(
+            name="raw_editor",
+            description="Edit raw text.",
+            on_invoke_tool=invoke_custom,
+            format={"type": "text"},
+            needs_approval=allow_without_approval,
+        )
+        agent = Agent(name="agent", tools=[custom_tool])
+        prior_custom_call = ResponseCustomToolCall(
+            type="custom_tool_call",
+            name=custom_tool.name,
+            call_id="call-prior",
+            input="prior",
+        )
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=cast(Any, prior_custom_call),
+                tool_name=custom_tool.name,
+            ),
+            always_reject=True,
+        )
+        next_custom_call = ResponseCustomToolCall(
+            type="custom_tool_call",
+            name=custom_tool.name,
+            call_id="call-next",
+            input="next",
+        )
+        result = await CustomToolAction.execute(
+            agent=agent,
+            call=ToolRunCustom(tool_call=next_custom_call, custom_tool=custom_tool),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert result.output == HITL_REJECTION_MSG
+    else:
+        editor = RecordingEditor()
+        apply_patch_tool = ApplyPatchTool(
+            editor=editor,
+            needs_approval=allow_without_approval,
+        )
+        agent = Agent(name="agent", tools=[apply_patch_tool])
+        prior_patch_call = cast(dict[str, Any], make_apply_patch_dict("call-prior"))
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=prior_patch_call,
+                tool_name=apply_patch_tool.name,
+            ),
+            always_reject=True,
+        )
+        next_patch_call = cast(dict[str, Any], make_apply_patch_dict("call-next"))
+        result = await ApplyPatchAction.execute(
+            agent=agent,
+            call=ToolRunApplyPatchCall(
+                tool_call=next_patch_call,
+                apply_patch_tool=apply_patch_tool,
+            ),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert HITL_REJECTION_MSG in str(result.output)
+        assert editor.operations == []
+
+    assert executed == []
+    assert checker_calls == []
 
 
 @pytest.mark.asyncio

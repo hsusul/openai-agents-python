@@ -3211,6 +3211,56 @@ class TestToolCallExecution:
         assert tool_calls == []
 
     @pytest.mark.asyncio
+    async def test_sticky_reject_takes_precedence_when_needs_approval_returns_false(
+        self, mock_model
+    ):
+        """Sticky always_reject must win even when needs_approval would return False."""
+        checker_calls: list[str] = []
+        tool_calls: list[str] = []
+
+        async def needs_approval(_ctx: Any, _params: dict[str, Any], call_id: str) -> bool:
+            checker_calls.append(call_id)
+            # First call interrupts; later calls would skip approval without sticky status.
+            return call_id == "call_reject_first"
+
+        async def invoke_tool(_ctx: ToolContext[Any], _arguments: str) -> str:
+            tool_calls.append("called")
+            return "should-not-run"
+
+        tool = FunctionTool(
+            name="send_email",
+            description="Send an email.",
+            params_json_schema={"type": "object", "properties": {}},
+            on_invoke_tool=invoke_tool,
+            needs_approval=needs_approval,
+        )
+        agent = RealtimeAgent(name="agent", tools=[tool])
+        session = RealtimeSession(mock_model, agent, None, run_config={"async_tool_calls": False})
+
+        first_call = RealtimeModelToolCallEvent(
+            name=tool.name, call_id="call_reject_first", arguments="{}"
+        )
+        second_call = RealtimeModelToolCallEvent(
+            name=tool.name, call_id="call_reject_second", arguments="{}"
+        )
+
+        await session._handle_tool_call(first_call)
+        await session.reject_tool_call(
+            first_call.call_id,
+            always=True,
+            rejection_message="sticky rejection",
+        )
+        await session._handle_tool_call(second_call)
+
+        assert session._pending_tool_calls == {}
+        assert [output for _call, output, _start in mock_model.sent_tool_outputs] == [
+            "sticky rejection",
+            "sticky rejection",
+        ]
+        assert tool_calls == []
+        assert checker_calls == ["call_reject_first"]
+
+    @pytest.mark.asyncio
     async def test_function_tool_exception_handling(
         self, mock_model, mock_agent, mock_function_tool
     ):
