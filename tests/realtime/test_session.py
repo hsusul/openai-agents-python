@@ -3261,6 +3261,62 @@ class TestToolCallExecution:
         assert checker_calls == ["call_reject_first"]
 
     @pytest.mark.asyncio
+    async def test_sticky_reject_recorded_while_needs_approval_awaits_still_wins(self, mock_model):
+        """A sticky rejection stored while a slow checker runs must block the tool."""
+        checker_started = asyncio.Event()
+        release_checker = asyncio.Event()
+        tool_calls: list[str] = []
+
+        async def needs_approval(_ctx: Any, _params: dict[str, Any], call_id: str) -> bool:
+            if call_id == "call_slow_second":
+                checker_started.set()
+                await release_checker.wait()
+                # Without a re-read the stale False result would bypass approval.
+                return False
+            return True
+
+        async def invoke_tool(_ctx: ToolContext[Any], _arguments: str) -> str:
+            tool_calls.append("called")
+            return "should-not-run"
+
+        tool = FunctionTool(
+            name="send_email",
+            description="Send an email.",
+            params_json_schema={"type": "object", "properties": {}},
+            on_invoke_tool=invoke_tool,
+            needs_approval=needs_approval,
+        )
+        agent = RealtimeAgent(name="agent", tools=[tool])
+        session = RealtimeSession(mock_model, agent, None, run_config={"async_tool_calls": True})
+
+        first_call = RealtimeModelToolCallEvent(
+            name=tool.name, call_id="call_slow_first", arguments="{}"
+        )
+        second_call = RealtimeModelToolCallEvent(
+            name=tool.name, call_id="call_slow_second", arguments="{}"
+        )
+
+        await session._handle_tool_call(first_call)
+        assert set(session._pending_tool_calls) == {first_call.call_id}
+
+        second_task = asyncio.create_task(session._handle_tool_call(second_call))
+        await checker_started.wait()
+        await session.reject_tool_call(
+            first_call.call_id,
+            always=True,
+            rejection_message="sticky rejection",
+        )
+        release_checker.set()
+        await second_task
+
+        assert session._pending_tool_calls == {}
+        assert [output for _call, output, _start in mock_model.sent_tool_outputs] == [
+            "sticky rejection",
+            "sticky rejection",
+        ]
+        assert tool_calls == []
+
+    @pytest.mark.asyncio
     async def test_function_tool_exception_handling(
         self, mock_model, mock_agent, mock_function_tool
     ):

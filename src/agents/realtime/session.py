@@ -590,6 +590,21 @@ class RealtimeSession(RealtimeModelListener):
             tool_lookup_key=tool_lookup_key,
         )
 
+    def _resolved_approval_status(
+        self,
+        function_tool: FunctionTool,
+        tool_call: RealtimeModelToolCallEvent,
+        approval_item: ToolApprovalItem,
+        tool_lookup_key: FunctionToolLookupKey | None,
+    ) -> bool | None:
+        """Return the stored approve/reject decision for a call, if any."""
+        return self._context_wrapper.get_approval_status(
+            function_tool.name,
+            tool_call.call_id,
+            existing_pending=approval_item,
+            tool_lookup_key=tool_lookup_key,
+        )
+
     async def _maybe_request_tool_approval(
         self,
         tool_call: RealtimeModelToolCallEvent,
@@ -609,20 +624,23 @@ class RealtimeSession(RealtimeModelListener):
 
         # Resolved approve/reject decisions are authoritative; do not re-await
         # needs_approval for a call whose status is already stored.
-        approval_status = self._context_wrapper.get_approval_status(
-            function_tool.name,
-            tool_call.call_id,
-            existing_pending=approval_item,
-            tool_lookup_key=tool_lookup_key,
+        approval_status = self._resolved_approval_status(
+            function_tool, tool_call, approval_item, tool_lookup_key
         )
-        if approval_status is True:
-            return True
-        if approval_status is False:
-            return False
+        if approval_status is not None:
+            return approval_status
 
         needs_approval = await self._function_needs_approval(function_tool, tool_call)
         if self._closing or self._closed:
             return None
+
+        # Tool calls are dispatched concurrently by default, so a sticky decision for
+        # another call of the same tool can land while the checker is awaited.
+        approval_status = self._resolved_approval_status(
+            function_tool, tool_call, approval_item, tool_lookup_key
+        )
+        if approval_status is not None:
+            return approval_status
         if not needs_approval:
             return True
 
@@ -644,6 +662,14 @@ class RealtimeSession(RealtimeModelListener):
 
         if self._closing or self._closed:
             return None
+
+        # Re-check once more so a decision recorded while guardrails ran is not
+        # replaced by a duplicate approval request.
+        approval_status = self._resolved_approval_status(
+            function_tool, tool_call, approval_item, tool_lookup_key
+        )
+        if approval_status is not None:
+            return approval_status
 
         self._pending_tool_calls[tool_call.call_id] = _PendingToolCall(
             tool_call=tool_call,
