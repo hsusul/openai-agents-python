@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 import tempfile
 import threading
 import time
@@ -2746,3 +2747,111 @@ async def test_create_branch_from_the_first_turn_still_succeeds():
         assert await session.get_items(branch_id="main") == items
     finally:
         session.close()
+
+
+async def test_a_branch_holding_no_messages_still_owns_its_id():
+    """A branch created from turn 1 copies no rows but must still claim its id."""
+    session = AdvancedSQLiteSession(
+        session_id="branch_empty_owns_id",
+        create_tables=True,
+    )
+    items = _branch_test_items()
+
+    try:
+        await session.add_items(items)
+        await session.create_branch_from_turn(1, "empty_branch")
+        await session.switch_to_branch("main")
+
+        with pytest.raises(ValueError, match="already exists"):
+            await session.create_branch_from_turn(2, "empty_branch")
+
+        # The rejected call must not have written the copied history into the empty branch.
+        assert await session.get_items(branch_id="empty_branch") == []
+        assert await session.get_items(branch_id="main") == items
+    finally:
+        session.close()
+
+
+async def test_generated_branch_ids_skip_a_branch_holding_no_messages(monkeypatch):
+    """A generated id must not land on an empty branch created in the same second."""
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+    session = AdvancedSQLiteSession(
+        session_id="branch_empty_generated",
+        create_tables=True,
+    )
+    items = _branch_test_items()
+
+    try:
+        await session.add_items(items)
+
+        empty_branch = await session.create_branch_from_turn(1)
+        assert await session.get_items(branch_id=empty_branch) == []
+
+        await session.switch_to_branch("main")
+        second_branch = await session.create_branch_from_turn(1)
+
+        assert second_branch != empty_branch
+    finally:
+        session.close()
+
+
+async def test_an_empty_branch_is_listed_switchable_and_deletable():
+    """A branch that holds no messages must still be reachable and removable."""
+    session = AdvancedSQLiteSession(
+        session_id="branch_empty_lifecycle",
+        create_tables=True,
+    )
+    items = _branch_test_items()
+
+    try:
+        await session.add_items(items)
+        await session.create_branch_from_turn(1, "empty_branch")
+        await session.switch_to_branch("main")
+
+        listed = {
+            branch["branch_id"]: branch["message_count"] for branch in await session.list_branches()
+        }
+        assert listed == {"main": len(items), "empty_branch": 0}
+
+        await session.switch_to_branch("empty_branch")
+        assert session._current_branch_id == "empty_branch"
+
+        await session.delete_branch("empty_branch", force=True)
+        assert [branch["branch_id"] for branch in await session.list_branches()] == ["main"]
+
+        # Deleting releases the id again.
+        assert await session.create_branch_from_turn(2, "empty_branch") == "empty_branch"
+    finally:
+        session.close()
+
+
+async def test_a_branch_id_claimed_on_another_connection_is_not_reused():
+    """Branch ids are claimed in the database, not only in this process's memory."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "branch_registry.db"
+        session = AdvancedSQLiteSession(
+            session_id="branch_other_connection",
+            db_path=db_path,
+            create_tables=True,
+        )
+        items = _branch_test_items()
+
+        try:
+            await session.add_items(items)
+
+            # Stand in for a writer outside this session, which the in-process
+            # connection lock does not serialize.
+            with contextlib.closing(sqlite3.connect(db_path)) as other_conn:
+                other_conn.execute(
+                    "INSERT INTO branches (session_id, branch_id) VALUES (?, ?)",
+                    ("branch_other_connection", "claimed_elsewhere"),
+                )
+                other_conn.commit()
+
+            with pytest.raises(ValueError, match="already exists"):
+                await session.create_branch_from_turn(2, "claimed_elsewhere")
+
+            assert await session.get_items(branch_id="claimed_elsewhere") == []
+            assert await session.get_items(branch_id="main") == items
+        finally:
+            session.close()

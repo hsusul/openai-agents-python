@@ -66,6 +66,11 @@ class AdvancedSQLiteSession(SQLiteSession):
             session_settings=session_settings,
             **kwargs,
         )
+        # Branch identity lives in its own table so a branch id is claimed even when the
+        # branch holds no messages. It is created unconditionally, like the base session
+        # tables, so a database written before this table existed gains it on open rather
+        # than failing the first branch operation.
+        self._init_branch_registry()
         if create_tables:
             self._init_structure_tables()
         self._current_branch_id = "main"
@@ -90,6 +95,26 @@ class AdvancedSQLiteSession(SQLiteSession):
                 return False
             self._current_branch_id = branch_id
             return True
+
+    def _init_branch_registry(self) -> None:
+        """Create the table that records which branch ids this session has claimed.
+
+        The primary key is what makes the branch-id uniqueness guarantee durable: it holds
+        for branches that copied no messages, and it is enforced by the database rather than
+        by a read-then-write check, so it also holds for writers in another process.
+        """
+        with self._locked_connection() as conn:
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS branches (
+                    session_id TEXT NOT NULL,
+                    branch_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_id, branch_id),
+                    FOREIGN KEY (session_id)
+                        REFERENCES {self.sessions_table}(session_id) ON DELETE CASCADE
+                )
+            """)
+            conn.commit()
 
     def _init_structure_tables(self):
         """Add structure and usage tracking tables.
@@ -377,8 +402,9 @@ class AdvancedSQLiteSession(SQLiteSession):
     async def clear_session(self) -> None:
         """Clear all items for this session.
 
-        Overrides the base implementation so the `message_structure` and
-        `turn_usage` metadata tables are cleared in the same transaction. Those
+        Overrides the base implementation so the `message_structure`,
+        `turn_usage`, and `branches` metadata tables are cleared in the same
+        transaction, which also releases every branch id this session held. Those
         rows declare an `ON DELETE CASCADE` foreign key, but SQLite does not
         enforce foreign keys unless `PRAGMA foreign_keys=ON` is set, so they must
         be deleted explicitly to avoid leaking stale structure and usage data.
@@ -401,6 +427,10 @@ class AdvancedSQLiteSession(SQLiteSession):
                     )
                     conn.execute(
                         "DELETE FROM turn_usage WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM branches WHERE session_id = ?",
                         (self.session_id,),
                     )
                     conn.commit()
@@ -931,16 +961,7 @@ class AdvancedSQLiteSession(SQLiteSession):
             """Synchronous helper to validate branch exists."""
             with self._locked_connection() as conn:
                 with closing(conn.cursor()) as cursor:
-                    cursor.execute(
-                        """
-                        SELECT COUNT(*) FROM message_structure
-                        WHERE session_id = ? AND branch_id = ?
-                    """,
-                        (self.session_id, branch_id),
-                    )
-
-                    count = cursor.fetchone()[0]
-                    if count == 0:
+                    if not self._branch_exists(cursor, branch_id):
                         raise ValueError(f"Branch '{branch_id}' does not exist")
 
         await asyncio.to_thread(_validate_branch)
@@ -986,17 +1007,17 @@ class AdvancedSQLiteSession(SQLiteSession):
             with self._locked_connection() as conn:
                 with closing(conn.cursor()) as cursor:
                     # First verify the branch exists
+                    if not self._branch_exists(cursor, branch_id):
+                        raise ValueError(f"Branch '{branch_id}' does not exist")
+
+                    # Release the branch id so it can be reused
                     cursor.execute(
                         """
-                        SELECT COUNT(*) FROM message_structure
+                        DELETE FROM branches
                         WHERE session_id = ? AND branch_id = ?
                     """,
                         (self.session_id, branch_id),
                     )
-
-                    count = cursor.fetchone()[0]
-                    if count == 0:
-                        raise ValueError(f"Branch '{branch_id}' does not exist")
 
                     # Delete from turn_usage first (foreign key constraint)
                     cursor.execute(
@@ -1054,19 +1075,32 @@ class AdvancedSQLiteSession(SQLiteSession):
             """Synchronous helper to list all branches."""
             with self._locked_connection() as conn:
                 with closing(conn.cursor()) as cursor:
+                    # Registered branches are listed even before they hold a message, so a
+                    # branch created from the first turn is visible rather than invisible
+                    # until something is added to it. 'main' and branches created before the
+                    # registry existed contribute through the second arm.
                     cursor.execute(
                         """
                         SELECT
-                            ms.branch_id,
-                            COUNT(*) as message_count,
+                            b.branch_id,
+                            COUNT(ms.id) as message_count,
                             COUNT(CASE WHEN ms.message_type = 'user' THEN 1 END) as user_turns,
-                            MIN(ms.created_at) as created_at
-                        FROM message_structure ms
-                        WHERE ms.session_id = ?
-                        GROUP BY ms.branch_id
+                            COALESCE(MIN(ms.created_at), b.created_at) as created_at
+                        FROM (
+                            SELECT branch_id, created_at FROM branches
+                            WHERE session_id = ?
+                            UNION
+                            SELECT DISTINCT branch_id, NULL FROM message_structure
+                            WHERE session_id = ? AND branch_id NOT IN (
+                                SELECT branch_id FROM branches WHERE session_id = ?
+                            )
+                        ) b
+                        LEFT JOIN message_structure ms
+                            ON ms.session_id = ? AND ms.branch_id = b.branch_id
+                        GROUP BY b.branch_id, b.created_at
                         ORDER BY created_at
                     """,
-                        (self.session_id,),
+                        (self.session_id, self.session_id, self.session_id, self.session_id),
                     )
 
                     branches = []
@@ -1086,17 +1120,46 @@ class AdvancedSQLiteSession(SQLiteSession):
 
         return await asyncio.to_thread(_list_branches_sync)
 
-    def _branch_id_exists(self, cursor: sqlite3.Cursor, branch_id: str) -> bool:
-        """Report whether any message is already recorded under this branch id."""
+    def _branch_exists(self, cursor: sqlite3.Cursor, branch_id: str) -> bool:
+        """Report whether this branch id is taken.
+
+        A branch is taken once it is registered, even before it holds any message. The
+        `message_structure` arm keeps branches created by an earlier version, which
+        predates the registry, recognizable.
+        """
         cursor.execute(
             """
+            SELECT 1 FROM branches
+            WHERE session_id = ? AND branch_id = ?
+            UNION ALL
             SELECT 1 FROM message_structure
             WHERE session_id = ? AND branch_id = ?
             LIMIT 1
             """,
-            (self.session_id, branch_id),
+            (self.session_id, branch_id, self.session_id, branch_id),
         )
         return cursor.fetchone() is not None
+
+    def _register_branch(self, cursor: sqlite3.Cursor, branch_id: str) -> None:
+        """Claim a branch id, or raise if something already holds it.
+
+        `main` is the implicit root branch and is never registered, so it is reserved here.
+        """
+        taken = ValueError(
+            f"Branch '{branch_id}' already exists. Branch IDs must be unique; "
+            "use switch_to_branch() to continue an existing branch."
+        )
+        if branch_id == "main" or self._branch_exists(cursor, branch_id):
+            raise taken
+        try:
+            cursor.execute(
+                "INSERT INTO branches (session_id, branch_id) VALUES (?, ?)",
+                (self.session_id, branch_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            # The primary key is the authority on uniqueness. The check above only reports
+            # the common case earlier and covers branches that predate the registry.
+            raise taken from exc
 
     def _generate_branch_id(self, cursor: sqlite3.Cursor, from_turn_number: int) -> str:
         """Build a branch id that no existing branch is using.
@@ -1107,7 +1170,7 @@ class AdvancedSQLiteSession(SQLiteSession):
         base_branch_id = f"branch_from_turn_{from_turn_number}_{int(time.time())}"
         branch_id = base_branch_id
         suffix = 1
-        while self._branch_id_exists(cursor, branch_id):
+        while self._branch_exists(cursor, branch_id):
             suffix += 1
             branch_id = f"{base_branch_id}_{suffix}"
         return branch_id
@@ -1133,88 +1196,104 @@ class AdvancedSQLiteSession(SQLiteSession):
             """Synchronous helper to copy messages to new branch."""
             with self._locked_connection() as conn:
                 with closing(conn.cursor()) as cursor:
-                    # Resolve the target branch id before any write so the existence check and
-                    # the inserts below cannot be separated by a concurrent branch creation.
-                    if new_branch_id is None:
-                        branch_id = self._generate_branch_id(cursor, from_turn_number)
-                    else:
-                        branch_id = new_branch_id
-                        if self._branch_id_exists(cursor, branch_id):
-                            raise ValueError(
-                                f"Branch '{branch_id}' already exists. Branch IDs must be "
-                                "unique; use switch_to_branch() to continue an existing branch."
-                            )
-
-                    # Get all messages before the branch point
-                    cursor.execute(
-                        """
-                        SELECT
-                            ms.message_id,
-                            ms.message_type,
-                            ms.sequence_number,
-                            ms.user_turn_number,
-                            ms.branch_turn_number,
-                            ms.tool_name
-                        FROM message_structure ms
-                        WHERE ms.session_id = ? AND ms.branch_id = ?
-                        AND ms.branch_turn_number < ?
-                        ORDER BY ms.sequence_number
-                    """,
-                        (self.session_id, self._current_branch_id, from_turn_number),
-                    )
-
-                    messages_to_copy = cursor.fetchall()
-
-                    if messages_to_copy:
-                        # Get the max sequence number for the new inserts
-                        cursor.execute(
-                            """
-                            SELECT COALESCE(MAX(sequence_number), 0)
-                            FROM message_structure
-                            WHERE session_id = ?
-                        """,
-                            (self.session_id,),
+                    # Take the write lock up front so resolving the id, claiming it, and
+                    # copying into it are one atomic step. A deferred transaction would let
+                    # a writer in another process pass the same availability check first;
+                    # the session lock only serializes this process.
+                    cursor.execute("BEGIN IMMEDIATE")
+                    try:
+                        branch_id = self._claim_branch_and_copy(
+                            cursor, new_branch_id, from_turn_number
                         )
-
-                        seq_start = cursor.fetchone()[0]
-
-                        # Insert copied messages with new branch_id
-                        new_structure_data = []
-                        for i, (
-                            msg_id,
-                            msg_type,
-                            _,
-                            user_turn,
-                            branch_turn,
-                            tool_name,
-                        ) in enumerate(messages_to_copy):
-                            new_structure_data.append(
-                                (
-                                    self.session_id,
-                                    msg_id,  # Same message_id (sharing the actual message data)
-                                    branch_id,
-                                    msg_type,
-                                    seq_start + i + 1,  # New sequence number
-                                    user_turn,  # Keep same global turn number
-                                    branch_turn,  # Keep same branch turn number
-                                    tool_name,
-                                )
-                            )
-
-                        cursor.executemany(
-                            """
-                            INSERT INTO message_structure
-                            (session_id, message_id, branch_id, message_type, sequence_number,
-                             user_turn_number, branch_turn_number, tool_name)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            new_structure_data,
-                        )
-
-                    conn.commit()
-                    return branch_id
+                        conn.commit()
+                        return branch_id
+                    except BaseException:
+                        conn.rollback()
+                        raise
 
         return await asyncio.to_thread(_copy_sync)
+
+    def _claim_branch_and_copy(
+        self, cursor: sqlite3.Cursor, new_branch_id: str | None, from_turn_number: int
+    ) -> str:
+        """Claim the target branch id and copy the pre-branch messages into it.
+
+        Runs inside the write transaction opened by `_copy_messages_to_new_branch`.
+        """
+        branch_id = (
+            self._generate_branch_id(cursor, from_turn_number)
+            if new_branch_id is None
+            else new_branch_id
+        )
+        self._register_branch(cursor, branch_id)
+
+        # Get all messages before the branch point
+        cursor.execute(
+            """
+            SELECT
+                ms.message_id,
+                ms.message_type,
+                ms.sequence_number,
+                ms.user_turn_number,
+                ms.branch_turn_number,
+                ms.tool_name
+            FROM message_structure ms
+            WHERE ms.session_id = ? AND ms.branch_id = ?
+            AND ms.branch_turn_number < ?
+            ORDER BY ms.sequence_number
+        """,
+            (self.session_id, self._current_branch_id, from_turn_number),
+        )
+
+        messages_to_copy = cursor.fetchall()
+
+        if messages_to_copy:
+            # Get the max sequence number for the new inserts
+            cursor.execute(
+                """
+                SELECT COALESCE(MAX(sequence_number), 0)
+                FROM message_structure
+                WHERE session_id = ?
+            """,
+                (self.session_id,),
+            )
+
+            seq_start = cursor.fetchone()[0]
+
+            # Insert copied messages with new branch_id
+            new_structure_data = []
+            for i, (
+                msg_id,
+                msg_type,
+                _,
+                user_turn,
+                branch_turn,
+                tool_name,
+            ) in enumerate(messages_to_copy):
+                new_structure_data.append(
+                    (
+                        self.session_id,
+                        msg_id,  # Same message_id (sharing the actual message data)
+                        branch_id,
+                        msg_type,
+                        seq_start + i + 1,  # New sequence number
+                        user_turn,  # Keep same global turn number
+                        branch_turn,  # Keep same branch turn number
+                        tool_name,
+                    )
+                )
+
+            cursor.executemany(
+                """
+                INSERT INTO message_structure
+                (session_id, message_id, branch_id, message_type, sequence_number,
+                 user_turn_number, branch_turn_number, tool_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                new_structure_data,
+            )
+
+        return branch_id
 
     async def get_conversation_turns(self, branch_id: str | None = None) -> list[dict[str, Any]]:
         """Get user turns with content for easy browsing and branching decisions.

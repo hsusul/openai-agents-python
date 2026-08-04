@@ -161,7 +161,7 @@ branch_id = await session.create_branch_from_content(
 )
 ```
 
-Branch IDs must be unique. Passing a `branch_name` that an existing branch already uses raises `ValueError`; use [`switch_to_branch()`][agents.extensions.memory.advanced_sqlite_session.AdvancedSQLiteSession.switch_to_branch] to continue an existing branch instead. Omitting `branch_name` always produces an unused ID.
+Branch IDs must be unique. Passing a `branch_name` that an existing branch already uses raises `ValueError`; use [`switch_to_branch()`][agents.extensions.memory.advanced_sqlite_session.AdvancedSQLiteSession.switch_to_branch] to continue an existing branch instead. Omitting `branch_name` always produces an unused ID. Each ID is claimed in the database, so it stays reserved even for a branch that copied no messages (one created from turn 1), and it is released again by [`delete_branch()`][agents.extensions.memory.advanced_sqlite_session.AdvancedSQLiteSession.delete_branch] or [`clear_session()`][agents.extensions.memory.advanced_sqlite_session.AdvancedSQLiteSession.clear_session].
 
 ### Branch management
 
