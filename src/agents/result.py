@@ -1166,20 +1166,20 @@ class RunResultStreaming(RunResultBase):
         return pretty_print_run_result_streaming(self)
 
     async def _await_task_safely(self, task: asyncio.Task[Any] | None) -> None:
-        """Await a task if present, ignoring cancellation and storing exceptions elsewhere.
+        """Wait for a task if present, leaving its cancellation and exceptions to _check_errors().
 
-        This ensures we do not lose late guardrail exceptions while not surfacing
-        CancelledError to callers of stream_events.
+        This ensures we do not lose late guardrail exceptions while not surfacing the task's
+        CancelledError to callers of stream_events. Cancellation of the consumer still propagates.
         """
         if task and not task.done():
+            # Do not await the task directly: its cancellation (e.g., due to result.cancel())
+            # would be indistinguishable from cancellation of this consumer.
             try:
-                await task
+                await asyncio.wait((task,))
             except asyncio.CancelledError:
-                # Task was cancelled (e.g., due to result.cancel()). Nothing to do here.
-                pass
-            except Exception:
-                # The exception will be surfaced via _check_errors() if needed.
-                pass
+                # This consumer was cancelled. Forward it to the task, as awaiting it would.
+                task.cancel()
+                raise
 
     def _drain_event_queue(self) -> None:
         """Remove any pending items from the event queue and mark them done."""

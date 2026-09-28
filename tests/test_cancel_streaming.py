@@ -6,13 +6,22 @@ import time
 import pytest
 from openai.types.responses import ResponseCompletedEvent
 
-from agents import Agent, Runner
+from agents import (
+    Agent,
+    ComputerProvider,
+    ComputerTool,
+    GuardrailFunctionOutput,
+    Runner,
+    function_tool,
+)
 from agents.guardrail import input_guardrail
 from agents.models.multi_provider import MultiProvider
 from agents.stream_events import RawResponsesStreamEvent
 from agents.testing import ScriptedModel
 
+from .test_computer_tool_lifecycle import FakeComputer
 from .test_responses import get_function_tool, get_function_tool_call, get_text_message
+from .testing_processor import fetch_events
 
 
 class SlowCompleteScriptedModel(ScriptedModel):
@@ -328,3 +337,96 @@ async def test_falsy_input_guardrail_exception_is_surfaced_after_stream() -> Non
     with pytest.raises(FalsyRuntimeError, match="falsy guardrail boom"):
         async for _ in result.stream_events():
             pass
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_pending_parallel_input_guardrail_finishes_run_cleanup() -> None:
+    guardrail_release = asyncio.Event()
+    tool_started = asyncio.Event()
+    disposed: list[FakeComputer] = []
+    computer_tool = ComputerTool(
+        computer=ComputerProvider[FakeComputer](
+            create=lambda *, run_context: FakeComputer(),
+            dispose=lambda *, run_context, computer: disposed.append(computer),
+        )
+    )
+
+    @input_guardrail
+    async def slow_guardrail(context, agent, input):
+        await guardrail_release.wait()
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)
+
+    @function_tool
+    async def slow_tool() -> str:
+        tool_started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    model = ScriptedModel(
+        [[get_function_tool_call("slow_tool", "{}", "call_1")], [get_text_message("done")]]
+    )
+    agent = Agent(
+        name="A",
+        model=model,
+        tools=[slow_tool, computer_tool],
+        input_guardrails=[slow_guardrail],
+    )
+    result = Runner.run_streamed(agent, input="hi")
+
+    async def consume() -> None:
+        async for _ in result.stream_events():
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        # The parallel input guardrail is still running when the run is cancelled.
+        result.cancel()
+        await asyncio.wait_for(consumer, timeout=1)
+    finally:
+        guardrail_release.set()
+
+    assert len(disposed) == 1
+    events = fetch_events()
+    assert events.count("trace_start") == events.count("trace_end") == 1
+    assert events.count("span_start") == events.count("span_end")
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancellation_while_awaiting_input_guardrail_propagates() -> None:
+    guardrail_started = asyncio.Event()
+    guardrail_release = asyncio.Event()
+
+    @input_guardrail
+    async def slow_guardrail(context, agent, input):
+        guardrail_started.set()
+        await guardrail_release.wait()
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)
+
+    model = ScriptedModel([[get_text_message("done")]])
+    agent = Agent(name="A", model=model, input_guardrails=[slow_guardrail])
+    result = Runner.run_streamed(agent, input="hi")
+
+    async def consume() -> None:
+        async for _ in result.stream_events():
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(guardrail_started.wait(), timeout=1)
+        while not result.is_complete:
+            await asyncio.sleep(0)
+        # Let the consumer drain the queued events and start waiting for the guardrail verdict.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not consumer.done()
+
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=1)
+    finally:
+        guardrail_release.set()
+
+    events = fetch_events()
+    assert events.count("trace_start") == events.count("trace_end") == 1
+    assert events.count("span_start") == events.count("span_end")

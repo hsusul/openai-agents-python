@@ -233,7 +233,16 @@ async def input_guardrail_tripwire_triggered_for_stream(
         return False
 
     if not task.done():
-        await task
+        # Do not await the task directly: its cancellation (e.g., due to result.cancel()) would be
+        # indistinguishable from cancellation of this caller and abort the caller's cleanup.
+        try:
+            await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            # This caller was cancelled. Forward it to the task, as awaiting it would.
+            task.cancel()
+            raise
+        if not task.cancelled():
+            task.result()
 
     return any(
         guardrail_result.output.tripwire_triggered
